@@ -2,8 +2,15 @@
 Kirill Duplyakin  217182546
 
 Trimester 1, 2019
-____________________
+___________________________
 
+Microcontroller:        ATMEGA328P in an Arduino Nano package
+Motor drivers:          2x VNH3SP30
+Time of Flight sensors: 2x VL53L0X
+IR sensors:             4x TCRT5000, has both a digital and an analog output
+Motors:                 2x JGB37-520B, Magnetic quadrature encoder included
+
+___________________________
 I/O
 
 Microcontroller has these external inputs:
@@ -22,23 +29,27 @@ To be able to initialise the two ToFs, one of them needs to be put in reset stat
 while the other ToF is given a non-default address 
 - 1 digital output pin is used for that
 
-_____________________
+___________________________
 
 Programming approach used is state machine programming. 
 
 - Task 1: seek and attack, avoid lines - 3 states
-- Task 2: seek, evade following the line carefully, and avoid arena edge - 3 states
+- Task 2: seek, evade, and avoid arena edge - 3 states
 - Competition: seek, avoid lines, attack, evade - 4 states
 
 -> First a simple selection is implemented at the end of setup function,
       to let the user pick the Task/Competition
+      Initially red light is flashing, indicating that the user hasn't made a selection
       - the button can be pressed to select a different mode
       - once the button is pressed, the countdown starts for the game
       - if button is pressed again during the countdown, 
           the countdown is reset and next mode is selected
+      - Yellow light indicates Task 1
+      - Green light  inidicates Task 2
+      - Blue light indicates competition mode
 
 -> Task 1
-  - The bot starts this task in seek mode, it has to then turn around 180
+  - The bot starts this task facing away from dummy opponent, it has to turn around 180, then go into seek mode
   - once seek mode identifies potential enemy, attack mode is activated
   - both modes can be interrupted by detecting arena edge, in this case, bot goes back into seek after 
       avoiding the line
@@ -47,29 +58,42 @@ Programming approach used is state machine programming.
 -> Task 2
   - The bot starts this task in seek mode
   - once seek mode identifies potential enemy, evade mode is activated
-    - evade mode incorporates it's own logic for following the line, so only
-    - seek mode can be interrupted by detecting arena edge, after avoiding line goes back to seek mode
+  - evade mode basically does a 90 degree turn away from the enemy and proceeds to the arena edge
+  - once arena edge is reached, seek mode is activated again
 
 
 -> Competition
   - The bot starts this task in seek mode
   - once seek mode identifies potential enemy, there's a different probability for attack and evade modes
-    - it may be a good strategy to evade on initial startup  
+    - it may be a good strategy to evade on initial startup, so the robot always tries to evade on the very first run
   - seek and attack can be interrupted by detecting arena edge, after avoiding line goes back to seek mode
 
 
-all 4 states/bahaviours share commonality between tasks/game
-
+// Safety functions include:
+- detection of shell lifting, from the front only
+- motor stall detection
 
 
 */
 
+//___________________________
+// Libraries
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <VL53L0X.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <PID_v1.h>
+
+//___________________________
+// Library objects
+
+//TOF object
+VL53L0X ToF_Left;
+VL53L0X ToF_Right;
+
+// PCA9685 board var, called this way, it uses the default address 0x40
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
 // I used OLED display for debugging, because it was easier than serial (no need to stay tethered)
 // however the program runs a lot slower with having to update the display
@@ -83,14 +107,8 @@ all 4 states/bahaviours share commonality between tasks/game
 // #endif
 
 
-//TOF vars
-VL53L0X ToF_Left;
-VL53L0X ToF_Right;
-
-
-// PCA9685 board var, called this way, it uses the default address 0x40
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
-
+//___________________________
+// #defines
 
 // ----------------------------
 // bitwise operations, macro functions that simplify reading the program a bit
@@ -151,45 +169,75 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 #define TOFRIGHT_ADDR   0x30
 
 // program specific
-#define PTIMEFREQ 1000 // desired timer freq, Hz
-#define TSAMP_ENC 100 // how often the encoder value should be sampled, ms
-#define ROUNDSTARTTIME 5000 // 5000 ms after a mode is selected to start the round
-#define PMAXPULSE 4096 // maximum PCA9685 PWM value, full ON
-#define PHALFPULSE 2048 // this is half width for PWM, max is 4096
+#define PTIMEFREQ 1000        // desired timer freq, Hz
+#define TSAMP_ENC 100         // how often the encoder value should be sampled, ms
+#define ROUNDSTARTTIME 5000   // 5000 ms after a mode is selected to start the round
+#define PMAXPULSE 4096        // maximum PCA9685 PWM value, full ON
+#define PHALFPULSE 2048       // this is half width for PWM, max is 4096
 
-#define TURNCONST 36 // helper constant to convert degrees to encoder clicks for turning on spot
+#define TURNCONST 36        // helper constant to convert degrees to encoder clicks for turning on spot
+#define TURNEVADE 9         // these are in degrees*10, so 9 = 90 degrees
+#define TURNSWEEP1 12
+#define TURNSWEEP2 TURNSWEEP1*2
+#define TURNAFTERSWEEP 6
+#define TURNIRFRONT 15
+#define TURNIRBACK 3
+#define TURNAROUND 18
+
+#define STRAIGHTCONST 31    // helper const to convert cm to encoder clicks for going straight
+#define MOVEFROMEDGEDIST 5  // move *cm from edge
+#define SPEEDFULL 300       // 300rpm -> 5rps -> (~650 clicks/rev) 3250clicks/s -> ~325 clicks/0.1s 
+#define SPEEDHALF 150       // i'm refreshing encoder value at 10 Hz 
+#define SPEEDQ 75
+
+
 
 
 #define TOFMAXRANGE 1200 // ToF sensor max meaningful reading
+#define TOFMINDIST 2 // ToF sensor reading when the shell is lifted
+
+#define EVADECHANCE 2 // chance of program initiating evade instead of attack after seek, out of 0-9
 
 //___________________________
-// variables
+// global variables
 
 // timer variables
 volatile uint32_t timer_INT = 0; // timer as per interrupt
-volatile uint32_t timer_prev = 0;
+volatile uint32_t timer_prev = 0; // toDo: has this been used?
 
 // motor encoders & speed control
-volatile uint16_t encR = 0; // if these are connected in opposite, simply switch them in ISR
+volatile uint16_t encR = 0; // counter for encoder clicks
 volatile uint16_t encL = 0;
-volatile uint16_t encL_prev = 0;
+volatile uint16_t encL_prev = 0;  // used for PID calcs
 volatile uint16_t encR_prev = 0;
 
+double kp = 15; // I'm going to use encoder value/time, at 4 rps (240 rpm, and ~1m/s), and ~650 clicks per revolution
+double ki = 10; // i'm expecting a value of around 260 and for full error I want an output of 3000-4000 for PWM.
+double kd = 0;  // that means proportional value of around 11-15
+volatile double rMotorInput, rMotorOutput, rMotorSetpoint, 
+                lMotorInput, lMotorOutput, lMotorSetpoint;
+
+// PID control for motors
+PID rMotorPID(&rMotorInput, &rMotorOutput, &rMotorSetpoint, kp, ki, kd, P_ON_M, DIRECT);
+PID lMotorPID(&lMotorInput, &lMotorOutput, &lMotorSetpoint, kp, ki, kd, P_ON_M, DIRECT);
 
 
 // motor encoder (& IR sensor interrupts)
-volatile uint8_t pcint_prevState = 0;   // byte of states
+volatile uint8_t pcint_prevState = 0;     // byte of states
 volatile bool irFront_left_state = false; // false is not triggered
 volatile bool irFront_right_state = false;
 volatile bool irBack_left_state = false;
 volatile bool irBack_right_state = false;
-volatile bool is_lineDetected = false;
+volatile bool ir_isAnyDetected = false;    // overall check to compare whether a detection has been made
 
 // ToF helpers
-volatile uint16_t ToF_Left_distmm = 0; // toDo: see if these variables are needed
+volatile uint16_t ToF_Left_distmm = 0;  // toDo: see if these variables are needed
 volatile uint16_t ToF_Right_distmm = 0;
-volatile bool ToF_Left_detect = false; // false means sensor is showing > TOFMAXRANGE
+volatile bool ToF_Left_detect = false;  // false means sensor is showing > TOFMAXRANGE
 volatile bool ToF_Right_detect = false; // false means sensor is showing > TOFMAXRANGE
+volatile bool ToF_last_detect = false;  // remember last known position, 
+                                        // whether enemy was to the right or left
+volatile bool ToF_shellLifted = false;  // detect whether robot shell is on the radar
 
 //__________________________
 /* Game mode select
@@ -199,8 +247,8 @@ game = 2
 initial statup = 3
 */
 volatile uint8_t gameMode = 3; 
-volatile uint8_t PledBlinkState = 0; // used to create a cool blinking animation
-volatile bool PledBlinkIncre = 1; // true is increasing
+volatile uint8_t PledBlinkState = 0;  // used to create a cool blinking animation
+volatile bool PledBlinkIncre = 1;     // true is increasing
 
 /* Game States
   These are states in game that determine what the robot is doing now
@@ -215,6 +263,9 @@ volatile uint8_t gameState = 0;
 // turn 180 on first run of task1
 volatile bool is_t1_firstRun = true;
 
+// Task 2 specific:
+
+
 // Competition mode specific:
 volatile bool is_gameFirstRun = true;
 
@@ -226,39 +277,85 @@ volatile bool is_gameFirstRun = true;
 
 // this simply collects distance readings from ToF sensors
 void checkToFdist(){
+  // get range
   if(!ToF_Right.timeoutOccurred()) ToF_Right_distmm = ToF_Right.readRangeContinuousMillimeters();
   if(!ToF_Left.timeoutOccurred()) ToF_Left_distmm = ToF_Left.readRangeContinuousMillimeters();
+  
+  // there's a small range where ToF will detect the shell and I can use it to get away from 
+  // the opponent, but I need to make sure this distance is small enough so that it's not mistaken for 
+  // pushing the opponent.
+  if(ToF_Left_distmm < TOFMINDIST && ToF_Left_distmm < TOFMINDIST) ToF_shellLifted = true;
+  else ToF_shellLifted = false;
+
+  // check if detection is within range
   if(ToF_Left_distmm < TOFMAXRANGE) ToF_Left_detect = true;
   else ToF_Left_detect = false;
   if(ToF_Right_distmm < TOFMAXRANGE) ToF_Right_detect = true;
   else ToF_Right_detect = false;
+
+  // save last known detection, used to figure out wihch way to scan/evade
+  if (ToF_Left_detect && !ToF_Right_distmm) ToF_last_detect = LEFT;
+  if (!ToF_Left_detect && ToF_Right_distmm) ToF_last_detect = RIGHT;
 }
 
+//___________________________
 // motor control functions
-void rMotorOn(bool forward = true, uint16_t pwmvalue = 0, bool disable = false){
+void updatePID(bool resetEnc = false){
+  // update interval of 100 ms
+  if(timer_INT<TSAMP_ENC)return; // if less than 100ms has passed, no need to update
+  
+  // update timer first to make sure time is taken accurately
+  timer_INT = 0;
+
+  // calculate the error
+  lMotorInput = (double)(encL - encL_prev);
+  rMotorInput = (double)(encR - encR_prev);
+  encL_prev = encL;
+  encR_prev = encR;
+
+  // calculate PID output
+  // setpoint is set in the caller function
+  rMotorPID.Compute();
+  lMotorPID.Compute();
+
+}
+void rMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = false){
+  // this function can be used for disabling the motors
   if (disable){
     pwm.setPin(PMOTOR_R1, 0);
     pwm.setPin(PMOTOR_R2, 0);
     pwm.setPin(PMOTOR_Rpwm, 0);
     return;
   }
+
+  // set speed in click/0.1s, calculate PID
+  rMotorSetpoint = speedClicks;
+  updatePID();
+
+  // forward motion
   if(forward){
     pwm.setPin(PMOTOR_R1, PMAXPULSE);
     pwm.setPin(PMOTOR_R2, 0);
   }
-  else{
+  else{ // backward motion
     pwm.setPin(PMOTOR_R1, 0);
     pwm.setPin(PMOTOR_R2, PMAXPULSE);
   }
-  pwm.setPin(PMOTOR_Rpwm, pwmvalue);
+  // PWM signal is set from PID output
+  pwm.setPin(PMOTOR_Rpwm, rMotorOutput);
 }
-void lMotorOn(bool forward = true, uint16_t pwmvalue = 0, bool disable = false){
+// same as above, but for left motor
+void lMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = false){
   if (disable){
     pwm.setPin(PMOTOR_L1, 0);
     pwm.setPin(PMOTOR_L2, 0);
     pwm.setPin(PMOTOR_Lpwm, 0);
     return;
   }
+
+  lMotorSetpoint = speedClicks;
+  updatePID();
+
   if(forward){
     pwm.setPin(PMOTOR_L1, PMAXPULSE);
     pwm.setPin(PMOTOR_L2, 0);
@@ -267,36 +364,34 @@ void lMotorOn(bool forward = true, uint16_t pwmvalue = 0, bool disable = false){
     pwm.setPin(PMOTOR_L1, 0);
     pwm.setPin(PMOTOR_L2, PMAXPULSE);
   }
-  pwm.setPin(PMOTOR_Lpwm, pwmvalue);
+  pwm.setPin(PMOTOR_Lpwm, lMotorOutput);
 }
-void turnOnSpot(uint8_t degX10,bool turnRight = true, uint16_t turnSpeed = 1000, bool is_seeking = false){
+void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks, bool is_seeking = false){
   
   // ~650 clicks per rev, i need to turn the wheels 
   uint16_t clicksToTurn = degX10*TURNCONST;
 
-  // reset encoder and time values 
+  // reset encoder 
   encL = 0;
   encR = 0;
-  // encL_prev = 0;
-  // encR_prev = 0;
-  // timer_INT = 0;
-  // timer_prev = 0;
+  encL_prev = 0;
+  encR_prev = 0;
+  // timer_INT = 0; // don't have to null time here because updatePID() function takes care of it ok
 
   
   
   if(turnRight){ // left motor forward, right motor back
     while((encL+encR) / 2 < clicksToTurn){
-      // toDo: implement PID later
       // avoid arena edge
-      if(is_lineDetected){
+      if(ir_isAnyDetected){
         gameState = 3;
         return;
       }
 
-      if (encL < clicksToTurn) lMotorOn(turnRight,turnSpeed);
+      if (encL <= clicksToTurn) lMotorOn(turnRight,turnSpeedClicks);
       else lMotorOn(0,0,1);
       
-      if(encR < clicksToTurn) rMotorOn(!turnRight,turnSpeed);
+      if(encR <= clicksToTurn) rMotorOn(!turnRight,turnSpeedClicks);
       else rMotorOn(0,0,1);
 
       if(is_seeking){
@@ -310,15 +405,15 @@ void turnOnSpot(uint8_t degX10,bool turnRight = true, uint16_t turnSpeed = 1000,
     while((encL+encR) / 2 < clicksToTurn){
 
       // avoid arena edge
-      if(is_lineDetected){
+      if(ir_isAnyDetected){
         gameState = 3;
         return;
       }
 
-      if (encL < clicksToTurn) lMotorOn(turnRight,turnSpeed);
+      if (encL < clicksToTurn) lMotorOn(turnRight,turnSpeedClicks);
       else lMotorOn(0,0,1);
       
-      if(encR < clicksToTurn) rMotorOn(!turnRight,turnSpeed);
+      if(encR < clicksToTurn) rMotorOn(!turnRight,turnSpeedClicks);
       else rMotorOn(0,0,1);
 
       if(is_seeking){
@@ -331,19 +426,50 @@ void turnOnSpot(uint8_t degX10,bool turnRight = true, uint16_t turnSpeed = 1000,
   lMotorOn(0,0,1);
   rMotorOn(0,0,1);
 }
-// void driveStraight(bool forward = true, uint16_t distCm){
-//   //650 clicks per 22 cm
-
-//   // toDo: implement PID
+void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
   
+  // reset encoder 
+  encL = 0;
+  encR = 0;
+  encL_prev = 0;
+  encR_prev = 0;
+  
+  // if distance is set, follow distance
+  if (distCm>0){
+    //~650 clicks per 22cm, up to a maximum of 150cm
+    uint16_t numClicks = distCm * STRAIGHTCONST;
+    
+    // drive forward all those clicks with disregard for IR
+    while((encL+encR)/2 < numClicks){
+      if(encL < numClicks) lMotorOn(forward,driveSpeedClicks);
+      else lMotorOn(0,0,1);
+      if(encR < numClicks) rMotorOn(forward,driveSpeedClicks);
+      else rMotorOn(0,0,1);
+    }
+    lMotorOn(0,0,1);
+    rMotorOn(0,0,1);
+    return;
+  }
+  //else
+  // drive til edge!
+  while(!ir_isAnyDetected){ 
+    lMotorOn(forward,driveSpeedClicks);
+    rMotorOn(forward,driveSpeedClicks);
+  }
+  // turn motors off again, just in case
+  lMotorOn(0,0,1);
+  rMotorOn(0,0,1);
+}
 
 
+//___________________________
+// Behaviour functions
 
-// }
 
-
+//___________________________
 // purpose of this function is to identify potential enemy and go to attack or evade
 // avoiding line should be treated with priority as well
+//___________________________
 void seek(){
   // indicate seek mode:
   pwm.setPin(PLED_BLUE, PLEDPWMMAX_BLUE, true);
@@ -356,16 +482,15 @@ void seek(){
   
   // if both sensors show above 1200, means nothing is within range
   // turn on spot for a number of clicks, but while detecting opponent
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(12, RIGHT, 500, 1);
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(24, LEFT, 500, 1);
+  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP1, ToF_last_detect, SPEEDQ, 1);
+  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP2, !ToF_last_detect, SPEEDQ, 1);
     // if nothing is detected after these sweeps, we want to turn and move until line
   if(!ToF_Left_detect && !ToF_Right_detect){
-    turnOnSpot(6, RIGHT, 1000);
+    turnOnSpot(TURNAFTERSWEEP, ToF_last_detect, SPEEDHALF);
+    
     // look for IR sensor detection
-    while(!is_lineDetected){ 
-      rMotorOn(FORWARD, 1000); // same direction
-      lMotorOn(FORWARD, 1000);
-    }
+    driveStraight(FORWARD, SPEEDHALF);
+    
     gameState = 3;
     return;
 
@@ -385,12 +510,9 @@ void seek(){
       break;
     
     case 2:
-      uint8_t randNum = random(10);
-      if(randNum<2) gameState = 2;
+      int randNum = random(10);
+      if(randNum<EVADECHANCE) gameState = 2;
       else gameState = 1;
-      break;
-    
-    default:
       break;
     }
     
@@ -400,18 +522,49 @@ void seek(){
 
 }
 
+//___________________________
 // drive towards the enemy in a straight line
 // avoiding line should be treated with priority as well
+//___________________________
 void attack(){
   // indicate mode
   pwm.setPin(PLED_BLUE, 0, true);
   pwm.setPin(PLED_YELLOW, 0,true);
   pwm.setPin(PLED_GREEN, PLEDPWMMAX_GREEN,true);
   pwm.setPin(PLED_RED, 0, true);
+
+  // reset encoder 
+  encL = 0;
+  encR = 0;
+  encL_prev = 0;
+  encR_prev = 0;
+
+  // track opponent by correcting for ToF readings
+  while (ToF_Left_detect || ToF_Right_detect){
+    if(ir_isAnyDetected){
+      gameState = 3; // move away from line
+      return;
+    }
+    
+    checkToFdist();
+    // whichever ToF shows, we need to go that way
+    // if both of them detect, then these expressions will account for that
+    uint16_t lspeed = SPEEDHALF*ToF_Right_detect;
+    uint16_t rspeed = SPEEDHALF*ToF_Left_detect;
+    lMotorOn(FORWARD,lspeed);
+    rMotorOn(FORWARD,rspeed);
+
+  }
+  
+  lMotorOn(0,0,1);
+  rMotorOn(0,0,1);
+  gameState = 0; // back to seek
+
   
 }
-
-// react to IR sensors, generally 
+//___________________________
+// react to IR sensors, generally retract from edge and turn around, exit into seek
+//___________________________
 void moveFromLine(){
   // indicate mode
   pwm.setPin(PLED_BLUE, 0, true);
@@ -424,18 +577,39 @@ void moveFromLine(){
 
   // which sensors were triggered?
   // front
-  if(irFront_left_state || irFront_left_state){
+  if(irFront_left_state){
     // drive back for a few cm, then turn on spot
+    driveStraight(BACKWARD,SPEEDHALF,5);
+    turnOnSpot(TURNIRFRONT, RIGHT, SPEEDHALF); // turn right
   }
-  else if(irBack_left_state || irBack_right_state){
+  else if(irFront_right_state){
+    // drive back for a few cm, then turn on spot
+    driveStraight(BACKWARD,SPEEDHALF,5);
+    turnOnSpot(TURNIRFRONT, LEFT, SPEEDHALF); // turn left
+  }
+  else if(irBack_left_state){
     // drive forward a few cm, then turn on spot
+    driveStraight(FORWARD,SPEEDHALF,5);
+    turnOnSpot(TURNIRBACK, RIGHT, SPEEDHALF); // turn right
+  }
+  else if(irBack_right_state){
+    driveStraight(FORWARD,SPEEDHALF,5);
+    turnOnSpot(TURNIRBACK, LEFT, SPEEDHALF); // turn left
   }
   
+  lMotorOn(0,0,1);
+  rMotorOn(0,0,1);
+
+  // return to seek
+  gameState = 0;
+
 
 
 }
 
-// goal of this function is to go to edge, drive along it enough to try to evade the enemy
+//___________________________
+// goal of this function is to go to edge perpendicular to last enemy detection
+//___________________________
 void evade(){
   // indicate mode
   pwm.setPin(PLED_BLUE, 0, true);
@@ -443,9 +617,26 @@ void evade(){
   pwm.setPin(PLED_GREEN, 0,true);
   pwm.setPin(PLED_RED, 0, true);   
 
+  // first I want to turn in a direction opposite of last known enemy position
+  // 90 degrees
+  turnOnSpot(TURNEVADE,!ToF_last_detect, SPEEDHALF);
+  
+
+  // then drive straight to the line
+  while(!ir_isAnyDetected){
+    driveStraight(FORWARD, SPEEDHALF);
+  }
+  // then back away from line a bit
+  driveStraight(BACKWARD, SPEEDHALF, 5);
+
+  // then seek the target again to see what's what
+  gameState = 0;
+
 }
 
-//____________________
+
+//___________________________
+//___________________________
 // main function entry, initialisation of the robot, selection of task/game mode
 void setup() {
 
@@ -550,6 +741,9 @@ void setup() {
   pwm.setPin(PTIMER, PHALFPULSE); // start the timer trigger pin
   _delay_ms(20);
 
+  // Motor quick PID set up
+  rMotorPID.SetOutputLimits(0,PMAXPULSE);
+  lMotorPID.SetOutputLimits(0,PMAXPULSE);
 
   //__________________________
   // task/Competition selection routine
@@ -612,7 +806,7 @@ void setup() {
 	// display.setTextColor(WHITE,BLACK);
 }
 
-
+//___________________________
 // __________________________
 // logic loop
 void loop() {
@@ -632,7 +826,7 @@ void loop() {
       switch (gameState)
       {
         case 0:
-          if(is_t1_firstRun) turnOnSpot(18);
+          if(is_t1_firstRun) turnOnSpot(TURNAROUND,RIGHT,SPEEDHALF);
           is_t1_firstRun = false;
           seek();
           break;
@@ -717,7 +911,7 @@ void loop() {
 
 
 
-
+//___________________________
 // __________________________
 // interrupt routines
 
@@ -745,7 +939,7 @@ ISR(PCINT0_vect){
   if(pcint_changes & BV(IRFRONT_LEFT)) irFront_left_state = !(pcint_current & BV(IRFRONT_LEFT));
   if(pcint_changes & BV(IRFRONT_RIGHT)) irFront_right_state = !(pcint_current & BV(IRFRONT_RIGHT));
   if(irBack_left_state || irBack_right_state || irFront_left_state || irFront_right_state) 
-            is_lineDetected = true;
+            ir_isAnyDetected = true;
 
   pcint_prevState = pcint_current;  
   //_delay_ms(100); // debug delay
