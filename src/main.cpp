@@ -15,8 +15,9 @@ I/O
 
 Microcontroller has these external inputs:
 - 4 IR line sensors, 2 on the front and 2 on the back, 
-- 2 Time of Flight sensors on the front
-- 2 Encoders on the motors
+  - IR sensor digital outputs are connected to Arduino on PCINT pins
+- 2 Time of Flight sensors on the front, I2C
+- 2 Encoders on the motors, PCINT as well, same bank of pins as IR
 - 1 Button, in pullup config (when not pressed, reads 1)
 
 - Additionally it controls a PWM extender module via I2C that returns back timing signal on interrupt INT0
@@ -70,8 +71,7 @@ Programming approach used is state machine programming.
 
 
 // Safety functions include:
-- detection of shell lifting, from the front only
-- motor stall detection
+- motor stall detection is implemented as a difference between 
 
 
 */
@@ -147,13 +147,68 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 // Button pin
 #define BUTTON PC1 // right now the button is connected to A1 = PC1
 
-// Encoder defines, motor related
+/* Game mode select
+task 1 = 0 // YLW
+task 2 = 1 // GRN
+game = 2   // BLU
+initial statup = 3 // RED
+*/
+#define TASK1 0
+#define TASK2 1
+#define GAME  2
+#define INITSTART 3
+
+/* Game States
+  These are states in game that determine what the robot is doing now
+  default is seek = 0 // BLU
+  attack = 1  // GRN
+  evade = 2   // YLW
+  moveFromEdge = 3 // RED
+*/
+#define SEEK    0
+#define ATTACK  1
+#define EVADE   2
+#define MOVEFROMEDGE 3
+
+
+// Motor related defines, encoder, PID etc
 #define ENC_LEFT PB0
 #define ENC_RIGHT PB1
 #define FORWARD true
 #define BACKWARD false
 #define RIGHT true
 #define LEFT false
+#define OFF 0
+#define DISABLE true
+
+#define KP 10     // I'm going to use encoder value/time, at 4 rps (240 rpm, and ~1m/s), and ~650 clicks per revolution
+#define KI 20     // i'm expecting a value of around 260 and for full error I want an output of 3000-4000 for PWM.
+#define KD 0      // that means proportional value of around 11-15
+
+#define SPEEDFULL 320         // 300rpm -> 5rps -> (~650 clicks/rev) 3250clicks/s -> ~325 clicks/0.1s 
+#define SPEEDHALF SPEEDFULL/2 // i'm refreshing encoder value at 10 Hz 
+#define SPEEDQ SPEEDFULL/4
+
+#define STALLTIME 3000  // maximum amount of time a motor is allowed to stall for
+#define STALLSPEED 20   // if motors are below this speed, start the timer
+#define STALLMAXCOUNT 5 // number of times the robot is allowed to stall per round
+#define STALLRECOVERYTIME 15000 // wait for 15 sec to cool down
+
+// Motor function converting helpers
+#define TURNCONST 40        // degrees to encoder clicks for turning on spot
+#define TURNEVADE 9         // these are in degrees*10, so 9 = 90 degrees
+#define TURNSWEEP1 12
+#define TURNSWEEP2 TURNSWEEP1*2
+#define TURNAFTERSWEEP 6
+#define TURNIRFRONT 15
+#define TURNIRBACK 3
+#define TURNAROUND 18
+
+#define STRAIGHTCONST 50    // helper const to convert cm to encoder clicks for going straight
+#define MOVEFROMEDGEDIST 5  // move *cm from edge
+
+// used to simplify disabling motors a bit
+#define MOTORSDISABLE lMotorOn(OFF,OFF,DISABLE);rMotorOn(OFF,OFF,DISABLE)
 
 // IR defines
 #define IRFRONT_LEFT PB2
@@ -168,42 +223,30 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 #define TOFLEFT_ADDR   0x31
 #define TOFRIGHT_ADDR   0x30
 
-// program specific
+// Timing
 #define PTIMEFREQ 1000        // desired timer freq, Hz
 #define TSAMP_ENC 100         // how often the encoder value should be sampled, ms
 #define ROUNDSTARTTIME 5000   // 5000 ms after a mode is selected to start the round
 #define PMAXPULSE 4096        // maximum PCA9685 PWM value, full ON
 #define PHALFPULSE 2048       // this is half width for PWM, max is 4096
 
-#define TURNCONST 36        // helper constant to convert degrees to encoder clicks for turning on spot
-#define TURNEVADE 9         // these are in degrees*10, so 9 = 90 degrees
-#define TURNSWEEP1 12
-#define TURNSWEEP2 TURNSWEEP1*2
-#define TURNAFTERSWEEP 6
-#define TURNIRFRONT 15
-#define TURNIRBACK 3
-#define TURNAROUND 18
-
-#define STRAIGHTCONST 31    // helper const to convert cm to encoder clicks for going straight
-#define MOVEFROMEDGEDIST 5  // move *cm from edge
-#define SPEEDFULL 300       // 300rpm -> 5rps -> (~650 clicks/rev) 3250clicks/s -> ~325 clicks/0.1s 
-#define SPEEDHALF 150       // i'm refreshing encoder value at 10 Hz 
-#define SPEEDQ 75
-
-
-
-
+// Time of Flight sensor ranges, mm
 #define TOFMAXRANGE 1200 // ToF sensor max meaningful reading
 #define TOFMINDIST 2 // ToF sensor reading when the shell is lifted
 
+// Random
 #define EVADECHANCE 2 // chance of program initiating evade instead of attack after seek, out of 0-9
+
 
 //___________________________
 // global variables
 
 // timer variables
-volatile uint32_t timer_INT = 0; // timer as per interrupt
-volatile uint32_t timer_prev = 0; // toDo: has this been used?
+volatile uint16_t timer_INT = 0;    // timer as per interrupt
+volatile uint16_t timer_stall = 0;  // time the motor has been in stall
+volatile uint8_t stallCounter = 0;  // number of times the robot stalled in this game
+volatile bool is_motorBeganStall = false;
+volatile bool is_motorStalled = false;
 
 // motor encoders & speed control
 volatile uint16_t encR = 0; // counter for encoder clicks
@@ -211,16 +254,11 @@ volatile uint16_t encL = 0;
 volatile uint16_t encL_prev = 0;  // used for PID calcs
 volatile uint16_t encR_prev = 0;
 
-double kp = 15; // I'm going to use encoder value/time, at 4 rps (240 rpm, and ~1m/s), and ~650 clicks per revolution
-double ki = 10; // i'm expecting a value of around 260 and for full error I want an output of 3000-4000 for PWM.
-double kd = 0;  // that means proportional value of around 11-15
-volatile double rMotorInput, rMotorOutput, rMotorSetpoint, 
-                lMotorInput, lMotorOutput, lMotorSetpoint;
-
 // PID control for motors
-PID rMotorPID(&rMotorInput, &rMotorOutput, &rMotorSetpoint, kp, ki, kd, P_ON_M, DIRECT);
-PID lMotorPID(&lMotorInput, &lMotorOutput, &lMotorSetpoint, kp, ki, kd, P_ON_M, DIRECT);
-
+double          rMotorInput, rMotorOutput, rMotorSetpoint, 
+                lMotorInput, lMotorOutput, lMotorSetpoint;
+PID rMotorPID(&rMotorInput, &rMotorOutput, &rMotorSetpoint, KP, KI, KD, DIRECT);
+PID lMotorPID(&lMotorInput, &lMotorOutput, &lMotorSetpoint, KP, KI, KD, DIRECT);
 
 // motor encoder (& IR sensor interrupts)
 volatile uint8_t pcint_prevState = 0;     // byte of states
@@ -240,24 +278,15 @@ volatile bool ToF_last_detect = false;  // remember last known position,
 volatile bool ToF_shellLifted = false;  // detect whether robot shell is on the radar
 
 //__________________________
-/* Game mode select
-task 1 = 0
-task 2 = 1
-game = 2
-initial statup = 3
-*/
-volatile uint8_t gameMode = 3; 
-volatile uint8_t PledBlinkState = 0;  // used to create a cool blinking animation
-volatile bool PledBlinkIncre = 1;     // true is increasing
+// Game Mode
+volatile uint8_t gameMode = INITSTART; 
 
-/* Game States
-  These are states in game that determine what the robot is doing now
-  default is seek = 0
-  attack = 1
-  evade = 2
-  moveFromLine = 3
-*/
-volatile uint8_t gameState = 0;
+// Game states
+volatile uint8_t gameState = SEEK;
+
+// setup blinker
+volatile uint16_t PledBlinkState = 0;  // used to create a cool blinking animation
+volatile bool PledBlinkIncre = 1;     // true is increasing
 
 // Task 1 specific:
 // turn 180 on first run of task1
@@ -275,12 +304,17 @@ volatile bool is_gameFirstRun = true;
 //___________________________
 // functions
 
-// this simply collects distance readings from ToF sensors
+// this simply collects distance readings from ToF sensors and updates related flags
 void checkToFdist(){
   // get range
   if(!ToF_Right.timeoutOccurred()) ToF_Right_distmm = ToF_Right.readRangeContinuousMillimeters();
   if(!ToF_Left.timeoutOccurred()) ToF_Left_distmm = ToF_Left.readRangeContinuousMillimeters();
   
+  // when distance is further than 1.1-1.2 meters, it outputs ~8980, 
+  // otherwise seems pretty reliable up to distances of 1m
+  // so i need to close the gap of 20-40cm by meandering
+
+
   // there's a small range where ToF will detect the shell and I can use it to get away from 
   // the opponent, but I need to make sure this distance is small enough so that it's not mistaken for 
   // pushing the opponent.
@@ -300,12 +334,15 @@ void checkToFdist(){
 
 //___________________________
 // motor control functions
-void updatePID(bool resetEnc = false){
+void updatePID(){
   // update interval of 100 ms
-  if(timer_INT<TSAMP_ENC)return; // if less than 100ms has passed, no need to update
+  if(timer_INT<TSAMP_ENC) return; // if less than 100ms has passed, no need to update
   
   // update timer first to make sure time is taken accurately
   timer_INT = 0;
+
+  // stall protection (a little recursive action from further functions, more description below)
+  if(is_motorStalled)return;
 
   // calculate the error
   lMotorInput = (double)(encL - encL_prev);
@@ -318,13 +355,47 @@ void updatePID(bool resetEnc = false){
   rMotorPID.Compute();
   lMotorPID.Compute();
 
+  //_________________
+  // Stall protection
+  // If motor speed is set to some reasonable value, 
+  // we need to check whether motor is running atleast at minimum speed
+  if((lMotorSetpoint > STALLSPEED && encL_prev < STALLSPEED) || 
+                (rMotorSetpoint > STALLSPEED && encR_prev < STALLSPEED))
+    // stall condition detected for one of the wheels
+    is_motorBeganStall = true;
+  else is_motorBeganStall = false;
+
+  if(is_motorBeganStall) timer_stall += TSAMP_ENC;
+  else timer_stall = 0;
+
+  if(timer_stall > STALLTIME){
+    // maximum stall time has been reached
+    is_motorStalled = true;
+    pwm.setPin(PMOTOR_L1, OFF);
+    pwm.setPin(PMOTOR_L2, OFF);
+    pwm.setPin(PMOTOR_Lpwm, OFF);
+    pwm.setPin(PMOTOR_R1, OFF);
+    pwm.setPin(PMOTOR_R2, OFF);
+    pwm.setPin(PMOTOR_Rpwm, OFF);
+    // need to try to do something else!
+    // try to evade!
+    gameState = EVADE;
+    timer_stall = STALLTIME - STALLTIME/2; // resetting this should be ok because the maneuver is going to be going back
+    // I've also implemented max amount of stalls allowed
+  }
+  ///________________
+
+  
+
 }
-void rMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = false){
+// right motor control function
+void rMotorOn(bool forward, uint16_t speedClicks, bool disable = false){
   // this function can be used for disabling the motors
   if (disable){
-    pwm.setPin(PMOTOR_R1, 0);
-    pwm.setPin(PMOTOR_R2, 0);
-    pwm.setPin(PMOTOR_Rpwm, 0);
+    pwm.setPin(PMOTOR_R1, OFF);
+    pwm.setPin(PMOTOR_R2, OFF);
+    pwm.setPin(PMOTOR_Rpwm, OFF);
+    rMotorSetpoint = 0;
     return;
   }
 
@@ -332,13 +403,16 @@ void rMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = fals
   rMotorSetpoint = speedClicks;
   updatePID();
 
+  // stall protection
+  if(is_motorStalled)return;
+
   // forward motion
   if(forward){
     pwm.setPin(PMOTOR_R1, PMAXPULSE);
-    pwm.setPin(PMOTOR_R2, 0);
+    pwm.setPin(PMOTOR_R2, OFF);
   }
   else{ // backward motion
-    pwm.setPin(PMOTOR_R1, 0);
+    pwm.setPin(PMOTOR_R1, OFF);
     pwm.setPin(PMOTOR_R2, PMAXPULSE);
   }
   // PWM signal is set from PID output
@@ -347,26 +421,31 @@ void rMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = fals
 // same as above, but for left motor
 void lMotorOn(bool forward = true, uint16_t speedClicks = 0, bool disable = false){
   if (disable){
-    pwm.setPin(PMOTOR_L1, 0);
-    pwm.setPin(PMOTOR_L2, 0);
-    pwm.setPin(PMOTOR_Lpwm, 0);
+    pwm.setPin(PMOTOR_L1, OFF);
+    pwm.setPin(PMOTOR_L2, OFF);
+    pwm.setPin(PMOTOR_Lpwm, OFF);
+    lMotorSetpoint = 0;
     return;
   }
 
   lMotorSetpoint = speedClicks;
   updatePID();
 
+  // stall protection
+  if(is_motorStalled)return;
+
   if(forward){
     pwm.setPin(PMOTOR_L1, PMAXPULSE);
-    pwm.setPin(PMOTOR_L2, 0);
+    pwm.setPin(PMOTOR_L2, OFF);
   }
   else{
-    pwm.setPin(PMOTOR_L1, 0);
+    pwm.setPin(PMOTOR_L1, OFF);
     pwm.setPin(PMOTOR_L2, PMAXPULSE);
   }
   pwm.setPin(PMOTOR_Lpwm, lMotorOutput);
 }
-void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks, bool is_seeking = false){
+// this function combines the above to turn around
+void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks){
   
   // ~650 clicks per rev, i need to turn the wheels 
   uint16_t clicksToTurn = degX10*TURNCONST;
@@ -383,19 +462,23 @@ void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks, bool is
   if(turnRight){ // left motor forward, right motor back
     while((encL+encR) / 2 < clicksToTurn){
       // avoid arena edge
-      if(ir_isAnyDetected){
-        gameState = 3;
+      if(ir_isAnyDetected && gameState != MOVEFROMEDGE){
+        gameState = MOVEFROMEDGE;
         return;
       }
 
       if (encL <= clicksToTurn) lMotorOn(turnRight,turnSpeedClicks);
-      else lMotorOn(0,0,1);
+      else lMotorOn(OFF,OFF,DISABLE);
       
       if(encR <= clicksToTurn) rMotorOn(!turnRight,turnSpeedClicks);
-      else rMotorOn(0,0,1);
+      else rMotorOn(OFF,OFF,DISABLE);
 
-      if(is_seeking){
-        checkToFdist();
+      // stall protection
+      if(is_motorStalled)return;
+
+      // if robot is in seek mode, interrupt this function on detection
+      checkToFdist(); // this is placed outside the below statement to keep checking and help seek 
+      if(gameState == SEEK && !is_t1_firstRun){ // in the right direction after evade()
         if (ToF_Left_detect || ToF_Right_detect) break;
       }
     }
@@ -405,27 +488,30 @@ void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks, bool is
     while((encL+encR) / 2 < clicksToTurn){
 
       // avoid arena edge
-      if(ir_isAnyDetected){
-        gameState = 3;
+      if(ir_isAnyDetected && gameState != MOVEFROMEDGE){
+        gameState = MOVEFROMEDGE;
         return;
       }
 
       if (encL < clicksToTurn) lMotorOn(turnRight,turnSpeedClicks);
-      else lMotorOn(0,0,1);
+      else lMotorOn(OFF,OFF,DISABLE);
       
       if(encR < clicksToTurn) rMotorOn(!turnRight,turnSpeedClicks);
-      else rMotorOn(0,0,1);
+      else rMotorOn(OFF,OFF,DISABLE);
 
-      if(is_seeking){
-        checkToFdist();
+      // stall protection
+      if(is_motorStalled)return;
+
+      checkToFdist();
+      if(gameState == SEEK && !is_t1_firstRun){
         if (ToF_Left_detect || ToF_Right_detect) break;
       }
     }
   }
   // turn motors off again, just in case
-  lMotorOn(0,0,1);
-  rMotorOn(0,0,1);
+  MOTORSDISABLE;
 }
+// this function combines the above to drive straight forwards or backwards
 void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
   
   // reset encoder 
@@ -442,12 +528,14 @@ void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
     // drive forward all those clicks with disregard for IR
     while((encL+encR)/2 < numClicks){
       if(encL < numClicks) lMotorOn(forward,driveSpeedClicks);
-      else lMotorOn(0,0,1);
+      else lMotorOn(OFF,OFF,DISABLE);
       if(encR < numClicks) rMotorOn(forward,driveSpeedClicks);
-      else rMotorOn(0,0,1);
+      else rMotorOn(OFF,OFF,DISABLE);
+      
+      // stall protection
+      if(is_motorStalled)return;
     }
-    lMotorOn(0,0,1);
-    rMotorOn(0,0,1);
+    MOTORSDISABLE;
     return;
   }
   //else
@@ -455,10 +543,13 @@ void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
   while(!ir_isAnyDetected){ 
     lMotorOn(forward,driveSpeedClicks);
     rMotorOn(forward,driveSpeedClicks);
+
+    // stall protection
+    if(is_motorStalled)return;
   }
+  
   // turn motors off again, just in case
-  lMotorOn(0,0,1);
-  rMotorOn(0,0,1);
+  MOTORSDISABLE;
 }
 
 
@@ -473,17 +564,20 @@ void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
 void seek(){
   // indicate seek mode:
   pwm.setPin(PLED_BLUE, PLEDPWMMAX_BLUE, true);
-  pwm.setPin(PLED_YELLOW, 0,true);
-  pwm.setPin(PLED_GREEN, 0,true);
-  pwm.setPin(PLED_RED, 0, true);
+  pwm.setPin(PLED_YELLOW, OFF,true);
+  pwm.setPin(PLED_GREEN, OFF,true);
+  pwm.setPin(PLED_RED, OFF, true);
+
+  // update ToF measurements
+  checkToFdist();
 
   // scan the field by turning around ~240 degrees, so turn one direction 120, and then turn other 240
   // if nothing found, change position and try again
   
   // if both sensors show above 1200, means nothing is within range
   // turn on spot for a number of clicks, but while detecting opponent
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP1, ToF_last_detect, SPEEDQ, 1);
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP2, !ToF_last_detect, SPEEDQ, 1);
+  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP1, ToF_last_detect, SPEEDQ);
+  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP2, !ToF_last_detect, SPEEDQ);
     // if nothing is detected after these sweeps, we want to turn and move until line
   if(!ToF_Left_detect && !ToF_Right_detect){
     turnOnSpot(TURNAFTERSWEEP, ToF_last_detect, SPEEDHALF);
@@ -491,7 +585,7 @@ void seek(){
     // look for IR sensor detection
     driveStraight(FORWARD, SPEEDHALF);
     
-    gameState = 3;
+    gameState = MOVEFROMEDGE;
     return;
 
   }
@@ -501,18 +595,18 @@ void seek(){
     // attack or evade!
     switch (gameMode)
     {
-    case 0:
-      gameState = 1;
+    case TASK1:
+      gameState = ATTACK;
       break;
     
-    case 1:
-      gameState = 2;
+    case TASK2:
+      gameState = EVADE;
       break;
     
-    case 2:
+    case GAME:
       int randNum = random(10);
-      if(randNum<EVADECHANCE) gameState = 2;
-      else gameState = 1;
+      if(randNum<EVADECHANCE) gameState = EVADE;
+      else gameState = ATTACK;
       break;
     }
     
@@ -528,10 +622,10 @@ void seek(){
 //___________________________
 void attack(){
   // indicate mode
-  pwm.setPin(PLED_BLUE, 0, true);
-  pwm.setPin(PLED_YELLOW, 0,true);
+  pwm.setPin(PLED_BLUE, OFF, true);
+  pwm.setPin(PLED_YELLOW, OFF,true);
   pwm.setPin(PLED_GREEN, PLEDPWMMAX_GREEN,true);
-  pwm.setPin(PLED_RED, 0, true);
+  pwm.setPin(PLED_RED, OFF, true);
 
   // reset encoder 
   encL = 0;
@@ -542,7 +636,12 @@ void attack(){
   // track opponent by correcting for ToF readings
   while (ToF_Left_detect || ToF_Right_detect){
     if(ir_isAnyDetected){
-      gameState = 3; // move away from line
+      gameState = MOVEFROMEDGE; // move away from line
+      return;
+    }
+    if(ToF_shellLifted) {
+      MOTORSDISABLE;
+      gameState = EVADE;
       return;
     }
     
@@ -554,54 +653,64 @@ void attack(){
     lMotorOn(FORWARD,lspeed);
     rMotorOn(FORWARD,rspeed);
 
+    // stall protection
+    if(is_motorStalled)return;
+
   }
   
-  lMotorOn(0,0,1);
-  rMotorOn(0,0,1);
-  gameState = 0; // back to seek
+  MOTORSDISABLE;
+  gameState = SEEK; // back to seek
 
   
 }
 //___________________________
 // react to IR sensors, generally retract from edge and turn around, exit into seek
 //___________________________
-void moveFromLine(){
+void moveFromEdge(){
   // indicate mode
-  pwm.setPin(PLED_BLUE, 0, true);
-  pwm.setPin(PLED_YELLOW, 0,true);
-  pwm.setPin(PLED_GREEN, 0,true);
+  pwm.setPin(PLED_BLUE, OFF, true);
+  pwm.setPin(PLED_YELLOW, OFF,true);
+  pwm.setPin(PLED_GREEN, OFF,true);
   pwm.setPin(PLED_RED, PLEDPWMMAX_RED, true);
 
-  lMotorOn(0,0,1);
-  rMotorOn(0,0,1);
+  MOTORSDISABLE;
 
   // which sensors were triggered?
   // front
   if(irFront_left_state){
     // drive back for a few cm, then turn on spot
-    driveStraight(BACKWARD,SPEEDHALF,5);
+    driveStraight(BACKWARD,SPEEDHALF,MOVEFROMEDGEDIST);
     turnOnSpot(TURNIRFRONT, RIGHT, SPEEDHALF); // turn right
+    
   }
   else if(irFront_right_state){
     // drive back for a few cm, then turn on spot
-    driveStraight(BACKWARD,SPEEDHALF,5);
+    driveStraight(BACKWARD,SPEEDHALF,MOVEFROMEDGEDIST);
     turnOnSpot(TURNIRFRONT, LEFT, SPEEDHALF); // turn left
   }
   else if(irBack_left_state){
     // drive forward a few cm, then turn on spot
-    driveStraight(FORWARD,SPEEDHALF,5);
+    driveStraight(FORWARD,SPEEDHALF,MOVEFROMEDGEDIST);
     turnOnSpot(TURNIRBACK, RIGHT, SPEEDHALF); // turn right
   }
   else if(irBack_right_state){
-    driveStraight(FORWARD,SPEEDHALF,5);
+    driveStraight(FORWARD,SPEEDHALF,MOVEFROMEDGEDIST);
     turnOnSpot(TURNIRBACK, LEFT, SPEEDHALF); // turn left
   }
+
+  // check if any of the IRs are still active
+  if(irBack_right_state||irBack_left_state||irFront_right_state||irFront_left_state) return;
   
-  lMotorOn(0,0,1);
-  rMotorOn(0,0,1);
+  // if not, we can move on to the next state
+  ir_isAnyDetected = false;
+  
+  // stall protection
+  if(is_motorStalled)return;
+  
+  MOTORSDISABLE;
 
   // return to seek
-  gameState = 0;
+  gameState = SEEK;
 
 
 
@@ -612,25 +721,32 @@ void moveFromLine(){
 //___________________________
 void evade(){
   // indicate mode
-  pwm.setPin(PLED_BLUE, 0, true);
+  pwm.setPin(PLED_BLUE, OFF, true);
   pwm.setPin(PLED_YELLOW, PLEDPWMMAX_YELLOW,true);
-  pwm.setPin(PLED_GREEN, 0,true);
-  pwm.setPin(PLED_RED, 0, true);   
+  pwm.setPin(PLED_GREEN, OFF,true);
+  pwm.setPin(PLED_RED, OFF, true);   
 
   // first I want to turn in a direction opposite of last known enemy position
   // 90 degrees
-  turnOnSpot(TURNEVADE,!ToF_last_detect, SPEEDHALF);
+  turnOnSpot(TURNEVADE,ToF_last_detect, SPEEDHALF);
   
 
   // then drive straight to the line
   while(!ir_isAnyDetected){
-    driveStraight(FORWARD, SPEEDHALF);
+    driveStraight(BACKWARD, SPEEDHALF);
   }
   // then back away from line a bit
-  driveStraight(BACKWARD, SPEEDHALF, 5);
+  driveStraight(FORWARD, SPEEDHALF, MOVEFROMEDGEDIST);
+
+  // reset ir detection
+  if(irBack_right_state||irBack_left_state||irFront_right_state||irFront_left_state){
+    gameState = MOVEFROMEDGE;
+    return;
+  } 
+  ir_isAnyDetected = false;
 
   // then seek the target again to see what's what
-  gameState = 0;
+  gameState = SEEK;
 
 }
 
@@ -747,10 +863,12 @@ void setup() {
 
   //__________________________
   // task/Competition selection routine
-  while(timer_INT - timer_prev <= ROUNDSTARTTIME){
+  while(timer_INT <= ROUNDSTARTTIME){
     
     // check for button presses, change game mode
     if(!(PINC & BV(BUTTON))){ // button is in pullup config, means it shows 1 when not pressed
+      // reset the timer
+      timer_INT = 0;
       //simple debounce, just wait
       _delay_ms(200);
       
@@ -765,31 +883,28 @@ void setup() {
       pwm.setPin(PLED_BLUE, 0, true);
       pwm.setPin(PLED_GREEN, 0, true);
       pwm.setPin(PLED_YELLOW, 0, true);
-      
-      // reset the timer
-      timer_INT = 0;
     }
 
     // indicate the current selected game mode
     switch(gameMode){
-      case 0:
+      case TASK1:
         pwm.setPin(PLED_YELLOW, PledBlinkState, true);
       break;
-      case 1:
+      case TASK2:
         pwm.setPin(PLED_GREEN, PledBlinkState, true);
       break;
-      case 2:
+      case GAME:
         pwm.setPin(PLED_BLUE, PledBlinkState, true);
       break;
-      case 3:
+      case INITSTART:
         pwm.setPin(PLED_RED, PledBlinkState, true);
       break;
     }
     PledBlinkState += (PledBlinkIncre - !PledBlinkIncre);
-    if(PledBlinkState> 4095) PledBlinkIncre = false;
+    if(PledBlinkState> PHALFPULSE) PledBlinkIncre = false;
     else if(PledBlinkState < 1) PledBlinkIncre = true;
 
-    if(gameMode == 3) timer_INT = 0;
+    if(gameMode == INITSTART) timer_INT = 0;
 
   }
   timer_INT = 0;
@@ -811,93 +926,104 @@ void setup() {
 // logic loop
 void loop() {
   
-  // update ToF measurements, i want to grab only good values 
-  checkToFdist();
-  // when distance is further than 1.1-1.2 meters, it outputs ~8980, 
-  // otherwise seems pretty reliable up to distances of 1m
-  // so i need to close the gap of 20-40cm by meandering
+  // stall protection
+  if(is_motorStalled) { // returned from all the functions and now I can try to evade
+    is_motorStalled = false; // reset current stall flag
+    
+    //count total amount of stalls and see if it's reached max
+    if(++stallCounter>=STALLMAXCOUNT){
+      timer_INT = 0;
+      while(timer_INT<STALLRECOVERYTIME){ // turn off motors and do nothing to cool down
+        MOTORSDISABLE;
 
-  //also can get current motor speed here?
+        // indicate max number of stalls reached
+        pwm.setPin(PLED_BLUE, OFF, true);
+        pwm.setPin(PLED_YELLOW, PLEDPWMMAX_YELLOW,true);
+        pwm.setPin(PLED_GREEN, OFF,true);
+        pwm.setPin(PLED_RED, PLEDPWMMAX_RED, true);
+      }
+      stallCounter = 0;
+      timer_INT = 0;
+    }
+  } 
 
-  // 
+  // switch statement for Tasks and States
   switch (gameMode)
   {
-    case 0: // Task 1
+    case TASK1: // Task 1
       switch (gameState)
       {
-        case 0:
+        case SEEK:
           if(is_t1_firstRun) turnOnSpot(TURNAROUND,RIGHT,SPEEDHALF);
           is_t1_firstRun = false;
           seek();
           break;
 
-        case 1:
+        case ATTACK:
           attack();
           break;
 
-        case 3:
-          moveFromLine();
+        case MOVEFROMEDGE:
+          moveFromEdge();
           break;
         
         default:
-          gameState = 0;
+          evade(); // for stalling condition
+          gameState = SEEK;
           break;
       }
     break;
 
-    case 1: // task 2
+    case TASK2: // task 2
       switch (gameState)
       {
-        case 0:
+        case SEEK:
           seek();
           break;
 
-        case 2:
+        case EVADE:
           evade();
           break;
 
-        case 3:
-          moveFromLine();
+        case MOVEFROMEDGE:
+          moveFromEdge();
           break;
         
         default:
-          gameState = 0;
+          gameState = SEEK;
           break;
       }
     break;
 
-    case 2: // Game
+    case GAME: // Game
       if(is_gameFirstRun) {
-        gameState = 2;
+        gameState = EVADE;
         is_gameFirstRun = false;
       }
       switch (gameState)
       {
-        case 0:
+        case SEEK:
           seek();
           break;
         
-        case 1:
+        case ATTACK:
           attack();
           break;
 
-        case 2:
+        case EVADE:
           evade();
           break;
 
-        case 3:
-          moveFromLine();
+        case MOVEFROMEDGE:
+          moveFromEdge();
           break;
         
         default:
-          gameState = 0;
+          gameState = SEEK;
           break;
       }
     break;
   }
-  
-
-
   
 
 
@@ -919,7 +1045,6 @@ void loop() {
 ISR(INT0_vect) { 
   timer_INT+=1; // quite simply count time up
 }
-
 
 // Pin Change interrupts
 // any of the pins' changes will trigger the entire interrupt
