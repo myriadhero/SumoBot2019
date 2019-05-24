@@ -1,7 +1,5 @@
-/* SER300 Sumo Robot
-Kirill Duplyakin  217182546
-
-Trimester 1, 2019
+/* 
+Semester 1, 2019
 ___________________________
 
 Microcontroller:        ATMEGA328P in an Arduino Nano package
