@@ -185,27 +185,30 @@ initial statup = 3 // RED
 #define KI 20     // i'm expecting a value of around 260 and for full error I want an output of 3000-4000 for PWM.
 #define KD 0      // that means proportional value of around 11-15
 
-#define SPEEDFULL 320         // 300rpm -> 5rps -> (~650 clicks/rev) 3250clicks/s -> ~325 clicks/0.1s 
-#define SPEEDHALF SPEEDFULL/2 // i'm refreshing encoder value at 10 Hz 
-#define SPEEDQ SPEEDFULL/4
+// i found that good value is 240, it manages to stop at the edge even with the tape tyres
+// might experiment with 300+?
+#define SPEEDFULL 160        // 300rpm -> 5rps -> (~650 clicks/rev) 3250clicks/s -> ~325 clicks/0.1s 
+#define SPEEDHALF 80 // i'm refreshing encoder value at 10 Hz 
+#define SPEEDTHIRD 60
 
 #define STALLTIME 3000  // maximum amount of time a motor is allowed to stall for
-#define STALLSPEED 20   // if motors are below this speed, start the timer
-#define STALLMAXCOUNT 5 // number of times the robot is allowed to stall per round
+#define STALLSPEED 10   // if motors are below this speed, start the timer
+#define STALLMAXCOUNT 10 // number of times the robot is allowed to stall per round
 #define STALLRECOVERYTIME 15000 // wait for 15 sec to cool down
 
 // Motor function converting helpers
-#define TURNCONST 40        // degrees to encoder clicks for turning on spot
+#define TURNCONST 35        // degrees to encoder clicks for turning on spot
 #define TURNEVADE 9         // these are in degrees*10, so 9 = 90 degrees
 #define TURNSWEEP1 12
 #define TURNSWEEP2 TURNSWEEP1*2
-#define TURNAFTERSWEEP 6
+#define TURNAFTERSWEEP 18
 #define TURNIRFRONT 15
 #define TURNIRBACK 3
 #define TURNAROUND 18
+#define TURNTHREESIXTY 36
 
 #define STRAIGHTCONST 50    // helper const to convert cm to encoder clicks for going straight
-#define MOVEFROMEDGEDIST 5  // move *cm from edge
+#define MOVEFROMEDGEDIST 3  // move *cm from edge
 
 // used to simplify disabling motors a bit
 #define MOTORSDISABLE lMotorOn(OFF,OFF,DISABLE);rMotorOn(OFF,OFF,DISABLE)
@@ -219,9 +222,16 @@ initial statup = 3 // RED
 // ToF sensor XSHUT pin needed to set address
 #define TOFLEFT_XSHUT PC2
 
-// I2C addresses
+// ToF I2C addresses
 #define TOFLEFT_ADDR   0x31
 #define TOFRIGHT_ADDR   0x30
+#define TOFTIMINGBUDGET 35000
+#define TOFRATELIMIT 0.35F
+#define TOFTIMEOUT 50
+
+// Time of Flight sensor ranges, mm
+#define TOFMAXRANGE 1000 // ToF sensor max meaningful reading, toDo: change to 1200 before comp
+#define TOFSHELLDIST 20 // ToF sensor reading when the shell is lifted
 
 // Timing
 #define PTIMEFREQ 1000        // desired timer freq, Hz
@@ -230,12 +240,8 @@ initial statup = 3 // RED
 #define PMAXPULSE 4096        // maximum PCA9685 PWM value, full ON
 #define PHALFPULSE 2048       // this is half width for PWM, max is 4096
 
-// Time of Flight sensor ranges, mm
-#define TOFMAXRANGE 1200 // ToF sensor max meaningful reading
-#define TOFMINDIST 2 // ToF sensor reading when the shell is lifted
-
 // Random
-#define EVADECHANCE 2 // chance of program initiating evade instead of attack after seek, out of 0-9
+#define EVADECHANCE 1 // chance of program initiating evade instead of attack after seek, out of 0-9
 
 
 //___________________________
@@ -273,7 +279,7 @@ volatile uint16_t ToF_Left_distmm = 0;  // toDo: see if these variables are need
 volatile uint16_t ToF_Right_distmm = 0;
 volatile bool ToF_Left_detect = false;  // false means sensor is showing > TOFMAXRANGE
 volatile bool ToF_Right_detect = false; // false means sensor is showing > TOFMAXRANGE
-volatile bool ToF_last_detect = false;  // remember last known position, 
+volatile bool ToF_last_detect = true;  // remember last known position, 
                                         // whether enemy was to the right or left
 volatile bool ToF_shellLifted = false;  // detect whether robot shell is on the radar
 
@@ -288,12 +294,6 @@ volatile uint8_t gameState = SEEK;
 volatile uint16_t PledBlinkState = 0;  // used to create a cool blinking animation
 volatile bool PledBlinkIncre = 1;     // true is increasing
 
-// Task 1 specific:
-// turn 180 on first run of task1
-volatile bool is_t1_firstRun = true;
-
-// Task 2 specific:
-
 
 // Competition mode specific:
 volatile bool is_gameFirstRun = true;
@@ -305,31 +305,31 @@ volatile bool is_gameFirstRun = true;
 // functions
 
 // this simply collects distance readings from ToF sensors and updates related flags
-void checkToFdist(){
+void ToF_checkDist(){
   // get range
-  if(!ToF_Right.timeoutOccurred()) ToF_Right_distmm = ToF_Right.readRangeContinuousMillimeters();
-  if(!ToF_Left.timeoutOccurred()) ToF_Left_distmm = ToF_Left.readRangeContinuousMillimeters();
-  
+  if(ToF_Right.timeoutOccurred()) return;
+  if(ToF_Left.timeoutOccurred()) return;
+  ToF_Right_distmm = ToF_Right.readRangeContinuousMillimeters();
+  ToF_Left_distmm = ToF_Left.readRangeContinuousMillimeters();
   // when distance is further than 1.1-1.2 meters, it outputs ~8980, 
   // otherwise seems pretty reliable up to distances of 1m
   // so i need to close the gap of 20-40cm by meandering
 
-
   // there's a small range where ToF will detect the shell and I can use it to get away from 
   // the opponent, but I need to make sure this distance is small enough so that it's not mistaken for 
   // pushing the opponent.
-  if(ToF_Left_distmm < TOFMINDIST && ToF_Left_distmm < TOFMINDIST) ToF_shellLifted = true;
+  if(ToF_Left_distmm < TOFSHELLDIST && ToF_Left_distmm < TOFSHELLDIST) ToF_shellLifted = true;
   else ToF_shellLifted = false;
 
   // check if detection is within range
-  if(ToF_Left_distmm < TOFMAXRANGE) ToF_Left_detect = true;
+  if((ToF_Left_distmm < TOFMAXRANGE) && (ToF_Left_distmm > TOFSHELLDIST)) ToF_Left_detect = true;
   else ToF_Left_detect = false;
-  if(ToF_Right_distmm < TOFMAXRANGE) ToF_Right_detect = true;
+  if((ToF_Right_distmm < TOFMAXRANGE) && (ToF_Right_distmm > TOFSHELLDIST)) ToF_Right_detect = true;
   else ToF_Right_detect = false;
 
   // save last known detection, used to figure out wihch way to scan/evade
-  if (ToF_Left_detect && !ToF_Right_distmm) ToF_last_detect = LEFT;
-  if (!ToF_Left_detect && ToF_Right_distmm) ToF_last_detect = RIGHT;
+  if (ToF_Left_detect && !ToF_Right_detect) ToF_last_detect = LEFT;
+  if (!ToF_Left_detect && ToF_Right_detect) ToF_last_detect = RIGHT;
 }
 
 //___________________________
@@ -474,11 +474,11 @@ void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks){
       else rMotorOn(OFF,OFF,DISABLE);
 
       // stall protection
-      if(is_motorStalled)return;
+      if(is_motorStalled) return;
 
       // if robot is in seek mode, interrupt this function on detection
-      checkToFdist(); // this is placed outside the below statement to keep checking and help seek 
-      if(gameState == SEEK && !is_t1_firstRun){ // in the right direction after evade()
+      ToF_checkDist(); // this is placed outside the below statement to keep checking and help seek 
+      if(gameState == SEEK){ // in the right direction after evade()
         if (ToF_Left_detect || ToF_Right_detect) break;
       }
     }
@@ -502,8 +502,8 @@ void turnOnSpot(uint8_t degX10,bool turnRight, uint16_t turnSpeedClicks){
       // stall protection
       if(is_motorStalled)return;
 
-      checkToFdist();
-      if(gameState == SEEK && !is_t1_firstRun){
+      ToF_checkDist();
+      if(gameState == SEEK){
         if (ToF_Left_detect || ToF_Right_detect) break;
       }
     }
@@ -553,6 +553,7 @@ void driveStraight(bool forward, uint16_t driveSpeedClicks, uint8_t distCm = 0){
 }
 
 
+//*****************************************************
 //___________________________
 // Behaviour functions
 
@@ -568,24 +569,25 @@ void seek(){
   pwm.setPin(PLED_GREEN, OFF,true);
   pwm.setPin(PLED_RED, OFF, true);
 
-  // update ToF measurements
-  checkToFdist();
-
   // scan the field by turning around ~240 degrees, so turn one direction 120, and then turn other 240
   // if nothing found, change position and try again
   
   // if both sensors show above 1200, means nothing is within range
   // turn on spot for a number of clicks, but while detecting opponent
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP1, ToF_last_detect, SPEEDQ);
-  if(!ToF_Left_detect && !ToF_Right_detect)turnOnSpot(TURNSWEEP2, !ToF_last_detect, SPEEDQ);
+  if((!ToF_Left_detect) && (!ToF_Right_detect))turnOnSpot(TURNSWEEP1, ToF_last_detect, SPEEDTHIRD);
+  if((!ToF_Left_detect) && (!ToF_Right_detect))turnOnSpot(TURNTHREESIXTY, !ToF_last_detect, SPEEDTHIRD);
     // if nothing is detected after these sweeps, we want to turn and move until line
-  if(!ToF_Left_detect && !ToF_Right_detect){
-    turnOnSpot(TURNAFTERSWEEP, ToF_last_detect, SPEEDHALF);
+  
+  
+  if((!ToF_Left_detect) && (!ToF_Right_detect)){
     
-    // look for IR sensor detection
-    driveStraight(FORWARD, SPEEDHALF);
+      turnOnSpot(TURNAFTERSWEEP, ToF_last_detect, SPEEDHALF);
+      
+      // look for IR sensor detection
+      driveStraight(FORWARD, SPEEDHALF);
+      
+      gameState = MOVEFROMEDGE;
     
-    gameState = MOVEFROMEDGE;
     return;
 
   }
@@ -593,22 +595,10 @@ void seek(){
   
   else { // one of the ToFs picked something UP!
     // attack or evade!
-    switch (gameMode)
-    {
-    case TASK1:
-      gameState = ATTACK;
-      break;
     
-    case TASK2:
-      gameState = EVADE;
-      break;
-    
-    case GAME:
       int randNum = random(10);
       if(randNum<EVADECHANCE) gameState = EVADE;
       else gameState = ATTACK;
-      break;
-    }
     
   }
 
@@ -645,13 +635,11 @@ void attack(){
       return;
     }
     
-    checkToFdist();
+    ToF_checkDist();
     // whichever ToF shows, we need to go that way
     // if both of them detect, then these expressions will account for that
-    uint16_t lspeed = SPEEDHALF*ToF_Right_detect;
-    uint16_t rspeed = SPEEDHALF*ToF_Left_detect;
-    lMotorOn(FORWARD,lspeed);
-    rMotorOn(FORWARD,rspeed);
+    lMotorOn(FORWARD,SPEEDFULL*ToF_Right_detect);
+    rMotorOn(FORWARD,SPEEDFULL*ToF_Left_detect);
 
     // stall protection
     if(is_motorStalled)return;
@@ -679,23 +667,23 @@ void moveFromEdge(){
   // front
   if(irFront_left_state){
     // drive back for a few cm, then turn on spot
-    driveStraight(BACKWARD,SPEEDHALF,MOVEFROMEDGEDIST);
-    turnOnSpot(TURNIRFRONT, RIGHT, SPEEDHALF); // turn right
+    driveStraight(BACKWARD,SPEEDFULL,MOVEFROMEDGEDIST);
+    turnOnSpot(TURNIRFRONT, RIGHT, SPEEDFULL); // turn right
     
   }
   else if(irFront_right_state){
     // drive back for a few cm, then turn on spot
-    driveStraight(BACKWARD,SPEEDHALF,MOVEFROMEDGEDIST);
-    turnOnSpot(TURNIRFRONT, LEFT, SPEEDHALF); // turn left
+    driveStraight(BACKWARD,SPEEDFULL,MOVEFROMEDGEDIST);
+    turnOnSpot(TURNIRFRONT, LEFT, SPEEDFULL); // turn left
   }
   else if(irBack_left_state){
     // drive forward a few cm, then turn on spot
-    driveStraight(FORWARD,SPEEDHALF,MOVEFROMEDGEDIST);
-    turnOnSpot(TURNIRBACK, RIGHT, SPEEDHALF); // turn right
+    driveStraight(FORWARD,SPEEDFULL,MOVEFROMEDGEDIST);
+    turnOnSpot(TURNIRBACK, RIGHT, SPEEDFULL); // turn right
   }
   else if(irBack_right_state){
-    driveStraight(FORWARD,SPEEDHALF,MOVEFROMEDGEDIST);
-    turnOnSpot(TURNIRBACK, LEFT, SPEEDHALF); // turn left
+    driveStraight(FORWARD,SPEEDFULL,MOVEFROMEDGEDIST);
+    turnOnSpot(TURNIRBACK, LEFT, SPEEDFULL); // turn left
   }
 
   // check if any of the IRs are still active
@@ -728,15 +716,14 @@ void evade(){
 
   // first I want to turn in a direction opposite of last known enemy position
   // 90 degrees
-  turnOnSpot(TURNEVADE,ToF_last_detect, SPEEDHALF);
+  turnOnSpot(TURNEVADE, ToF_last_detect, SPEEDFULL);
   
-
   // then drive straight to the line
   while(!ir_isAnyDetected){
     driveStraight(BACKWARD, SPEEDHALF);
   }
   // then back away from line a bit
-  driveStraight(FORWARD, SPEEDHALF, MOVEFROMEDGEDIST);
+  driveStraight(FORWARD, SPEEDFULL, MOVEFROMEDGEDIST);
 
   // reset ir detection
   if(irBack_right_state||irBack_left_state||irFront_right_state||irFront_left_state){
@@ -821,7 +808,9 @@ void setup() {
   
   _delay_ms(10);
 
-  ToF_Right.setTimeout(100);
+  ToF_Right.setTimeout(TOFTIMEOUT); 
+  ToF_Right.setSignalRateLimit(TOFRATELIMIT);
+  ToF_Right.setMeasurementTimingBudget(TOFTIMINGBUDGET);
 
   _delay_ms(10);
   
@@ -842,7 +831,9 @@ void setup() {
 
   _delay_ms(10);
 
-  ToF_Left.setTimeout(100);
+  ToF_Left.setTimeout(TOFTIMEOUT);
+  ToF_Left.setSignalRateLimit(TOFRATELIMIT); 
+  ToF_Left.setMeasurementTimingBudget(TOFTIMINGBUDGET); 
   
   _delay_ms(20);
 
@@ -863,6 +854,8 @@ void setup() {
 
   //__________________________
   // task/Competition selection routine
+
+  timer_INT = 0;
   while(timer_INT <= ROUNDSTARTTIME){
     
     // check for button presses, change game mode
@@ -948,82 +941,34 @@ void loop() {
   } 
 
   // switch statement for Tasks and States
-  switch (gameMode)
-  {
-    case TASK1: // Task 1
-      switch (gameState)
-      {
-        case SEEK:
-          if(is_t1_firstRun) turnOnSpot(TURNAROUND,RIGHT,SPEEDHALF);
-          is_t1_firstRun = false;
-          seek();
-          break;
-
-        case ATTACK:
-          attack();
-          break;
-
-        case MOVEFROMEDGE:
-          moveFromEdge();
-          break;
-        
-        default:
-          evade(); // for stalling condition
-          gameState = SEEK;
-          break;
-      }
-    break;
-
-    case TASK2: // task 2
-      switch (gameState)
-      {
-        case SEEK:
-          seek();
-          break;
-
-        case EVADE:
-          evade();
-          break;
-
-        case MOVEFROMEDGE:
-          moveFromEdge();
-          break;
-        
-        default:
-          gameState = SEEK;
-          break;
-      }
-    break;
-
-    case GAME: // Game
-      if(is_gameFirstRun) {
-        gameState = EVADE;
-        is_gameFirstRun = false;
-      }
-      switch (gameState)
-      {
-        case SEEK:
-          seek();
-          break;
-        
-        case ATTACK:
-          attack();
-          break;
-
-        case EVADE:
-          evade();
-          break;
-
-        case MOVEFROMEDGE:
-          moveFromEdge();
-          break;
-        
-        default:
-          gameState = SEEK;
-          break;
-      }
-    break;
+  
+  if(is_gameFirstRun) {
+    gameState = EVADE;
+    is_gameFirstRun = false;
   }
+  switch (gameState)
+  {
+    case SEEK:
+      seek();
+      break;
+    
+    case ATTACK:
+      attack();
+      break;
+
+    case EVADE:
+      evade();
+      break;
+
+    case MOVEFROMEDGE:
+      moveFromEdge();
+      break;
+    
+    default:
+      gameState = SEEK;
+      break;
+  }
+  
   
 
 
